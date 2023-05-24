@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -17,60 +18,56 @@ import (
 	"time"
 )
 
-var projectToken = "b8ea8af6-ffee-44b3-aa9a-1fc02233cfb7"
-
 func init() {
 	timeout = time.Second
 	tlsSkipVerify = true
+	version = "1.2.3"
 }
 
 func TestHandshakeTimeout(t *testing.T) {
+	token := "b8ea8af6-ffee-44b3-aa9a-1fc02233cfb7"
 	addr, stop := gateway(t, func(listener net.Listener) {
 		// doesn't accept connections
 	})
 	defer stop()
-	_, err := connect(addr, "", projectToken)
+	var err error
+	_, err = connect(addr, "", token, []byte("config_data"))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "context deadline exceeded")
+	assert.Contains(t, err.Error(), "deadline exceeded")
 }
 
 func TestHandshakeError(t *testing.T) {
+	token := "b8ea8af6-ffee-44b3-aa9a-1fc02233cfb7"
 	addr, stop := gateway(t, func(listener net.Listener) {
 		conn, err := listener.Accept()
 		require.NoError(t, err)
-		readToken(t, conn)
+		readHeaderAndConfig(t, conn, token, []byte("config_data"))
 		writeStatus(t, conn, 500)
 	})
 	defer stop()
-	_, err := connect(addr, "", projectToken)
+	_, err := connect(addr, "", token, []byte("config_data"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to authenticate project")
 }
 
 func TestProxy(t *testing.T) {
-	endpointCh := make(chan string)
+	sessionChan := make(chan *yamux.Session)
+	token := "b8ea8af6-ffee-44b3-aa9a-1fc02233cfb7"
+	version = "1.2.3"
+
 	addr, stop := gateway(t, func(listener net.Listener) {
 		conn, err := listener.Accept()
 		require.NoError(t, err)
-		readToken(t, conn)
+		readHeaderAndConfig(t, conn, token, []byte("config_data"))
 		writeStatus(t, conn, 200)
-
-		endpoint, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		endpointCh <- endpoint.Addr().String()
 
 		cfg := yamux.DefaultConfig()
 		cfg.KeepAliveInterval = time.Second
+
 		session, err := yamux.Client(conn, cfg)
 		require.NoError(t, err)
-		clientConn, err := endpoint.Accept()
-		require.NoError(t, err)
-		tunConn, err := session.Open()
-		require.NoError(t, err)
-		go func() {
-			io.Copy(clientConn, tunConn)
-		}()
-		io.Copy(tunConn, clientConn)
+
+		sessionChan <- session
 	})
 	defer stop()
 
@@ -79,25 +76,78 @@ func TestProxy(t *testing.T) {
 	}))
 	defer prometheus.Close()
 
-	gwConn, err := connect(addr, "", projectToken)
+	pyroscope := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "Pyroscope is Healthy.")
+	}))
+	defer pyroscope.Close()
+
+	gwConn, err := connect(addr, "", token, []byte("config_data"))
 	go func() {
-		proxy(context.Background(), gwConn, prometheus.Listener.Addr().String())
+		proxy(context.Background(), gwConn)
 	}()
 
-	endpointAddr := <-endpointCh
-	res, err := http.Get("http://" + endpointAddr + "/-/healthy")
+	session := <-sessionChan
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			stream, err := session.Open()
+			if err != nil {
+				return nil, err
+			}
+			if err := binary.Write(stream, binary.LittleEndian, uint16(len(prometheus.Listener.Addr().String()))); err != nil {
+				return nil, err
+			}
+			if _, err = stream.Write([]byte(prometheus.Listener.Addr().String())); err != nil {
+				return nil, err
+			}
+			return stream, nil
+		},
+	}
+	client := &http.Client{Transport: transport}
+
+	res, err := client.Get("http://any/-/healthy")
 	require.NoError(t, err)
 	data, err := ioutil.ReadAll(res.Body)
 	require.NoError(t, err)
 	res.Body.Close()
 	assert.Equal(t, "Prometheus is Healthy.", string(data))
+
+	transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			stream, err := session.Open()
+			if err != nil {
+				return nil, err
+			}
+			if err := binary.Write(stream, binary.LittleEndian, uint16(len(pyroscope.Listener.Addr().String()))); err != nil {
+				return nil, err
+			}
+			if _, err = stream.Write([]byte(pyroscope.Listener.Addr().String())); err != nil {
+				return nil, err
+			}
+			return stream, nil
+		},
+	}
+	client = &http.Client{Transport: transport}
+
+	res, err = client.Get("http://any/-/healthy")
+	require.NoError(t, err)
+	data, err = ioutil.ReadAll(res.Body)
+	require.NoError(t, err)
+	res.Body.Close()
+	assert.Equal(t, "Pyroscope is Healthy.", string(data))
+
 }
 
-func readToken(t *testing.T, conn net.Conn) {
-	buf := make([]byte, 36)
-	_, err := conn.Read(buf)
+func readHeaderAndConfig(t *testing.T, conn net.Conn, token string, config []byte) {
+	h := Header{}
+	require.NoError(t, binary.Read(conn, binary.LittleEndian, &h))
+	require.Equal(t, token, string(h.Token[:]))
+	require.Equal(t, version, string(bytes.Trim(h.Version[:], "\x00")))
+
+	buf := make([]byte, int(h.ConfigSize))
+	_, err := io.ReadFull(conn, buf)
 	require.NoError(t, err)
-	require.Equal(t, projectToken, string(buf))
+	require.Equal(t, config, buf)
 }
 
 func writeStatus(t *testing.T, conn net.Conn, status uint16) {
