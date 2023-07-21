@@ -42,12 +42,12 @@ func TestHandshakeError(t *testing.T) {
 		conn, err := listener.Accept()
 		require.NoError(t, err)
 		readHeaderAndConfig(t, conn, token, []byte("config_data"))
-		writeStatus(t, conn, 500)
+		writeResponse(t, conn, 500, "internal server error")
 	})
 	defer stop()
 	_, err := connect(addr, "", token, []byte("config_data"))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to authenticate project")
+	assert.Contains(t, err.Error(), "internal server error")
 }
 
 func TestProxy(t *testing.T) {
@@ -59,7 +59,7 @@ func TestProxy(t *testing.T) {
 		conn, err := listener.Accept()
 		require.NoError(t, err)
 		readHeaderAndConfig(t, conn, token, []byte("config_data"))
-		writeStatus(t, conn, 200)
+		writeResponse(t, conn, 200, "")
 
 		cfg := yamux.DefaultConfig()
 		cfg.KeepAliveInterval = time.Second
@@ -139,7 +139,7 @@ func TestProxy(t *testing.T) {
 }
 
 func readHeaderAndConfig(t *testing.T, conn net.Conn, token string, config []byte) {
-	h := Header{}
+	h := RequestHeader{}
 	require.NoError(t, binary.Read(conn, binary.LittleEndian, &h))
 	require.Equal(t, token, string(h.Token[:]))
 	require.Equal(t, version, string(bytes.Trim(h.Version[:], "\x00")))
@@ -150,8 +150,11 @@ func readHeaderAndConfig(t *testing.T, conn net.Conn, token string, config []byt
 	require.Equal(t, config, buf)
 }
 
-func writeStatus(t *testing.T, conn net.Conn, status uint16) {
-	require.NoError(t, binary.Write(conn, binary.LittleEndian, status))
+func writeResponse(t *testing.T, conn net.Conn, status uint16, message string) {
+	err := binary.Write(conn, binary.LittleEndian, ResponseHeader{Status: status, MessageSize: uint16(len(message))})
+	require.NoError(t, err)
+	_, err = conn.Write([]byte(message))
+	require.NoError(t, err)
 }
 
 func gateway(t *testing.T, handler func(g net.Listener)) (string, func()) {
