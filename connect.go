@@ -59,16 +59,18 @@ func (t *Tunnel) keepConnected(ctx context.Context) {
 			return
 		default:
 			t.gwConn, err = connect(t.address, t.serverName, t.token, t.config)
+			if err == nil {
+				err = proxy(ctx, t.gwConn)
+				_ = t.gwConn.Close()
+			}
 			if err != nil {
-				d := b.Duration()
 				klog.Errorln(err)
-				klog.Errorf("reconnecting to %s in %.0fs", t.address, d.Seconds())
+				d := b.Duration()
+				klog.Infof("reconnecting to %s in %.0fs", t.address, d.Seconds())
 				time.Sleep(d)
 				continue
 			}
 			b.Reset()
-			proxy(ctx, t.gwConn)
-			_ = t.gwConn.Close()
 		}
 	}
 }
@@ -220,25 +222,23 @@ func connect(gwAddr, serverName, token string, config []byte) (net.Conn, error) 
 	return gwConn, nil
 }
 
-func proxy(ctx context.Context, gwConn net.Conn) {
+func proxy(ctx context.Context, gwConn net.Conn) error {
 	cfg := yamux.DefaultConfig()
 	cfg.KeepAliveInterval = time.Second
 	cfg.LogOutput = io.Discard
 	session, err := yamux.Server(gwConn, cfg)
 	if err != nil {
-		klog.Errorln("failed to start a TCP multiplexing server:", err)
-		return
+		return fmt.Errorf("failed to start a TCP multiplexing server: %s", err)
 	}
 	defer session.Close()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 			gwStream, err := session.Accept()
 			if err != nil {
-				klog.Errorf("failed to accept a stream: %s", err)
-				return
+				return fmt.Errorf("failed to accept a stream: %s", err)
 			}
 			go func(c net.Conn) {
 				defer c.Close()

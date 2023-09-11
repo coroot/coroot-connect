@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -83,7 +82,7 @@ func TestProxy(t *testing.T) {
 
 	gwConn, err := connect(addr, "", token, []byte("config_data"))
 	go func() {
-		proxy(context.Background(), gwConn)
+		require.NoError(t, proxy(context.Background(), gwConn))
 	}()
 
 	session := <-sessionChan
@@ -107,7 +106,7 @@ func TestProxy(t *testing.T) {
 
 	res, err := client.Get("http://any/-/healthy")
 	require.NoError(t, err)
-	data, err := ioutil.ReadAll(res.Body)
+	data, err := io.ReadAll(res.Body)
 	require.NoError(t, err)
 	res.Body.Close()
 	assert.Equal(t, "Prometheus is Healthy.", string(data))
@@ -131,7 +130,7 @@ func TestProxy(t *testing.T) {
 
 	res, err = client.Get("http://any/-/healthy")
 	require.NoError(t, err)
-	data, err = ioutil.ReadAll(res.Body)
+	data, err = io.ReadAll(res.Body)
 	require.NoError(t, err)
 	res.Body.Close()
 	assert.Equal(t, "Pyroscope is Healthy.", string(data))
