@@ -60,8 +60,12 @@ func (t *Tunnel) keepConnected(ctx context.Context) {
 		default:
 			t.gwConn, err = connect(t.address, t.serverName, t.token, t.config)
 			if err == nil {
+				start := time.Now()
 				err = proxy(ctx, t.gwConn)
 				_ = t.gwConn.Close()
+				if time.Since(start) > b.Max {
+					b.Reset()
+				}
 			}
 			if err != nil {
 				klog.Errorln(err)
